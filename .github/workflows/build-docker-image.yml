@@ -1,0 +1,219 @@
+name: Build and Push Docker Image (New)
+
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch:
+    inputs:
+      proxyguard_version:
+        description: "ProxyGuard upstream version/tag to build"
+        required: false
+        default: ""
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  prepare:
+    name: Resolve version and check registry
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      image: ${{ steps.image.outputs.name }}
+      should_build: ${{ steps.decide.outputs.value }}
+    
+    steps:
+      - name: Compute lowercase image name
+        id: image
+        shell: bash
+        run: |
+          image="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          echo "name=${image,,}" >> "$GITHUB_OUTPUT"
+      
+      - name: Resolve ProxyGuard version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${{ github.event.inputs.proxyguard_version }}" ]]; then
+            version="${{ github.event.inputs.proxyguard_version }}"
+            echo "Using manually provided version: $version"
+          else
+            echo "Fetching latest ProxyGuard release from Codeberg..."
+            version=$(curl -fsSL "https://codeberg.org/api/v1/repos/eduVPN/proxyguard/releases?per_page=1" | jq -r '.[0].tag_name')
+            if [[ -z "$version" || "$version" == "null" ]]; then
+              echo "::error::Could not determine latest ProxyGuard release from Codeberg API"
+              exit 1
+            fi
+            echo "Latest ProxyGuard release: $version"
+          fi
+
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+      
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Decide whether to build
+        id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image="${{ steps.image.outputs.name }}"
+          tag="${{ steps.version.outputs.value }}"
+
+          echo "Checking if manifest $image:$tag exists and is fully resolvable..."
+
+          # Pull the top-level manifest. If the tag does not exist at all,
+          # this fails immediately and we need to build.
+          if ! raw=$(docker buildx imagetools inspect "$image:$tag" --raw 2>/dev/null); then
+            echo "Tag $tag does not exist, build required."
+            echo "value=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # If it is a manifest list / image index, also verify every
+          # referenced child manifest is still present in the registry.
+          # A previous cleanup run may have deleted referenced digests,
+          # leaving a dangling list that resolves but cannot be pulled.
+          mediaType=$(echo "$raw" | jq -r '.mediaType // ""')
+          case "$mediaType" in
+            *manifest.list*|*image.index*)
+              digests=$(echo "$raw" | jq -r '.manifests[].digest')
+              for d in $digests; do
+                if ! docker buildx imagetools inspect "${image}@${d}" >/dev/null 2>&1; then
+                  echo "Referenced child manifest $d is missing — manifest list is broken."
+                  echo "Build required to repair $image:$tag."
+                  echo "value=true" >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
+              done
+              ;;
+          esac
+
+          echo "Tag $tag is intact, skipping build."
+          echo "value=false" >> "$GITHUB_OUTPUT"
+  
+  build:
+    name: Build & slim (${{ matrix.arch }})
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      
+      - name: Setup Go
+        uses: actions/setup-go@v6
+      
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Donwload ProxyGuard Repository
+        run: |
+          set -euo pipefail
+
+          version="${{ needs.prepare.outputs.version }}"
+          echo "Downloading ProxyGuard version $version from Codeberg..."
+          curl -L -o proxyguard.tar.gz "https://codeberg.org/eduVPN/proxyguard/archive/$version.tar.gz"
+          mkdir -p proxyguard
+          tar -xzf proxyguard.tar.gz --strip-components=1 -C proxyguard
+          echo "ProxyGuard source downloaded and extracted."
+      
+      - name: Build ProxyGuard
+        run: |
+          set -euo pipefail
+
+          version="${{ needs.prepare.outputs.version }}"
+          echo "Building ProxyGuard version $version..."
+          cd proxyguard
+          go build -ldflags="-s -w" -o proxyguard-server ./cmd/proxyguard-server
+          echo "ProxyGuard built successfully."
+        env:
+          CGO_ENABLED: 0
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+      
+      - name: Build and push per-arch image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./.github/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+          push: true
+          tags: |
+            ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}-${{ matrix.arch }}
+            ${{ needs.prepare.outputs.image }}:latest-${{ matrix.arch }}
+
+  merge:
+    name: Merge Platform Images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    needs: [prepare, build]
+    steps:
+      - name: Log into GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Create manifest lists and push
+        run: |
+          set -euo pipefail
+
+          image="${{ needs.prepare.outputs.image }}"
+          version="${{ needs.prepare.outputs.version }}"
+
+          echo "Creating versioned manifest list $image:$version"
+          docker buildx imagetools create \
+            --tag "$image:$version" \
+            "$image:${version}-amd64" \
+            "$image:${version}-arm64"
+
+          echo "Creating rolling manifest list $image:latest"
+          docker buildx imagetools create \
+            --tag "$image:latest" \
+            "$image:latest-amd64" \
+            "$image:latest-arm64"
+
+      - name: Inspect Image
+        run: |
+          docker buildx imagetools inspect "${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.version }}"
